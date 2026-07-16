@@ -1,0 +1,497 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+<title>Blind Mage — Balance</title>
+<style>
+  /* ==========================================================================
+     Minimal DEBUG-ONLY visuals. The game is meant to be played eyes-closed
+     from vibration alone; everything on screen is here so a sighted developer
+     can tell what the logic and sensor are doing.
+     ========================================================================== */
+  * { box-sizing: border-box; -webkit-user-select: none; user-select: none; }
+  html, body {
+    margin: 0; padding: 0; height: 100%; width: 100%;
+    overflow: hidden;                 /* no scroll */
+    touch-action: none;               /* no gesture panning/zoom */
+    background: #10141c; color: #cdd6e6;
+    font-family: -apple-system, Segoe UI, Roboto, sans-serif;
+    -webkit-tap-highlight-color: transparent;
+  }
+  #app { height: 100%; display: flex; flex-direction: column; padding: 16px; gap: 14px; }
+  h1 { font-size: 17px; margin: 0; font-weight: 600; letter-spacing: .5px; color: #9fb4d6; }
+  .muted { color: #6b7896; font-size: 12px; line-height: 1.4; }
+
+  /* Big primary button used for the required user-gesture permission request */
+  button {
+    font-size: 16px; padding: 14px 18px; border-radius: 12px; border: none;
+    background: #2f6df6; color: #fff; font-weight: 600; touch-action: manipulation;
+  }
+  button.secondary { background: #263042; color: #b9c6df; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; }
+
+  /* Difficulty selector chips */
+  .chip {
+    padding: 10px 16px; border-radius: 999px; background: #1b2233; color: #8ba0c4;
+    font-size: 14px; border: 1px solid #2a3550;
+  }
+  .chip.active { background: #2f6df6; color: #fff; border-color: #2f6df6; }
+
+  /* Lean bar: shows current lean position and the two fall thresholds */
+  #barWrap { position: relative; height: 46px; background: #171d2a; border-radius: 12px;
+             border: 1px solid #26304a; overflow: hidden; }
+  .threshold { position: absolute; top: 0; bottom: 0; width: 2px; background: #e0554f; opacity: .8; }
+  .centre    { position: absolute; top: 0; bottom: 0; left: 50%; width: 1px; background: #384863; }
+  #leanDot   { position: absolute; top: 50%; width: 26px; height: 26px; margin: -13px 0 0 -13px;
+               border-radius: 50%; background: #4fd1a1; transition: background .1s; }
+  #leanDot.warn { background: #f0b24a; }
+  #leanDot.danger { background: #e0554f; }
+
+  .readout { font-variant-numeric: tabular-nums; font-size: 13px; color: #7f8fb0; }
+  #state { font-size: 22px; font-weight: 700; min-height: 30px; }
+  #state.balanced { color: #4fd1a1; }
+  #state.tip      { color: #f0b24a; }
+  #state.fell     { color: #e0554f; }
+  #state.win      { color: #6fa8ff; }
+  #sensorWarn { color: #e0554f; font-size: 13px; min-height: 18px; }
+  .spacer { flex: 1; }
+  .timebar { height: 6px; background: #1b2233; border-radius: 4px; overflow: hidden; }
+  #timeFill { height: 100%; width: 0%; background: #6fa8ff; }
+</style>
+</head>
+<body>
+<div id="app">
+  <h1>BLIND MAGE · BALANCE</h1>
+  <p class="muted">Tilt the phone left/right to counter-balance on the log. Feel the vibration — eyes closed. Visuals are debug only.</p>
+
+  <div class="row" id="difficultyRow">
+    <div class="chip" data-diff="easy">Easy</div>
+    <div class="chip active" data-diff="medium">Medium</div>
+    <div class="chip" data-diff="hard">Hard</div>
+  </div>
+
+  <div class="row">
+    <button id="startBtn">Start / Enable Tilt</button>
+    <button id="againBtn" class="secondary" style="display:none">Try again</button>
+  </div>
+
+  <div id="sensorWarn"></div>
+
+  <!-- DEBUG lean bar -->
+  <div id="barWrap">
+    <div class="centre"></div>
+    <div class="threshold" id="thL"></div>
+    <div class="threshold" id="thR"></div>
+    <div id="leanDot"></div>
+  </div>
+
+  <div class="timebar"><div id="timeFill"></div></div>
+
+  <div id="state" class="balanced">ready</div>
+
+  <div class="readout">
+    raw tilt (gamma): <span id="rawTilt">—</span>°　|
+    lean: <span id="leanVal">0.00</span>　|
+    drift: <span id="driftVal">0.00</span>
+  </div>
+  <div class="readout">time left: <span id="timeVal">—</span>s</div>
+
+  <div class="spacer"></div>
+  <p class="muted">Must be served over <b>HTTPS</b> (e.g. GitHub Pages) or the tilt sensor stays silent. Opening the file locally will NOT give sensor data.</p>
+</div>
+
+<script>
+/* ============================================================================
+   CONFIG  —  ALL tunable values live here. Tune "feel" from this block only.
+   Everything is unit-agnostic: "lean" runs roughly -1 (full left) .. +1 (full
+   right); 0 is centred. Thresholds/forces are expressed in that same space.
+   ============================================================================ */
+const CONFIG = {
+
+  // ---- FALL / WIN --------------------------------------------------------
+  // How far off-centre (|lean|) before you're falling. 1.0 = edge of the bar.
+  fallThreshold: 1.0,
+  // Lean must stay past the threshold this long (seconds) before you actually
+  // fall — a short grace period so a single spike doesn't kill you. Tune for
+  // forgiveness: bigger = easier to recover.
+  fallGrace: 0.35,
+
+  // ---- TILT -> LEAN CORRECTION ------------------------------------------
+  // Raw device gamma (degrees) at which the player is applying "full" counter
+  // force. ~25–35° is a comfortable phone tilt. Smaller = twitchier.
+  tiltFullDeg: 30,
+  // How strongly the player's tilt pushes lean back toward centre, per second.
+  // This is the main "responsiveness" knob. Too low = feels unresponsive /
+  // impossible; too high = trivially easy and jittery.
+  correctStrength: 2.6,
+  // Smoothing on the raw sensor (0..1 per frame). Higher = smoother but laggier.
+  tiltSmoothing: 0.15,
+
+  // ---- DRIFT (the challenge) --------------------------------------------
+  // The drift is a smoothly-wandering target the world pushes you toward.
+  // driftStrength = how hard drift pulls lean away from centre, per second.
+  // driftSpeed    = how fast the drift target wanders (higher = more chaotic).
+  driftStrength: 1.4,
+  driftSpeed: 0.55,
+  // Max absolute value the drift target can reach (keeps it survivable).
+  driftMax: 0.9,
+
+  // ---- PHYSICS FEEL ------------------------------------------------------
+  // Extra damping on lean velocity so movement feels weighty, not slippery.
+  leanDamping: 1.8,
+
+  // ---- SURVIVAL ----------------------------------------------------------
+  // Target survive time in seconds. Prompt goal: ~10–15s.
+  duration: 12,
+
+  // ---- HAPTICS: intensity via pulse LENGTH + GAP -------------------------
+  // Web vibration is on/off only, so "intensity" is faked with pulse length and
+  // how often pulses fire. We interpolate between CALM (near centre) and URGENT
+  // (near falling) using |lean| normalised to the fall threshold.
+  haptics: {
+    // Pulse ON duration (ms) — grows with danger (longer = feels stronger).
+    pulseMsCalm:   18,
+    pulseMsUrgent: 75,
+    // Gap between pulse *cycles* (ms) — shrinks with danger (faster = urgent).
+    gapMsCalm:   900,   // calm heartbeat: infrequent
+    gapMsUrgent: 120,   // urgent: rapid-fire
+    // Below this |lean| (normalised 0..1) we're "centred": barely buzz at all.
+    calmZone: 0.18,
+
+    // ---- SIDE CUE: which way am I tipping? -------------------------------
+    // Vibration has no direction, so LEFT vs RIGHT is conveyed by PATTERN.
+    // These are vibrate() pattern arrays [on,off,on,off,...] in ms, scaled by
+    // urgency at runtime. NEEDS REAL-DEVICE TESTING to confirm they're
+    // distinguishable by feel alone.
+    //   LEFT  = double-buzz  (buzz-buzz)   -> "two taps means lean is left"
+    //   RIGHT = single buzz  (one longer)  -> "one tap means lean is right"
+    leftPattern:  [1, 0.35, 1],   // relative: on, off, on  (doubled)
+    rightPattern: [1.6],          // relative: single, a bit longer/stronger
+
+    // Only apply a directional pattern once past this danger level; below it,
+    // both sides feel like the same gentle centred heartbeat.
+    sideCueThreshold: 0.30,
+  },
+
+  // Distinct FALL buzz: one sharp long buzz.
+  fallPattern: [500],
+  // Celebratory SUCCESS pattern.
+  winPattern: [60, 60, 60, 60, 120, 80, 240],
+
+  // ---- DIFFICULTY PRESETS -----------------------------------------------
+  // Each preset overrides drift strength/speed and duration. Everything else
+  // (correction, haptics) stays constant so "feel" is consistent.
+  difficulties: {
+    easy:   { driftStrength: 1.0, driftSpeed: 0.40, duration: 10 },
+    medium: { driftStrength: 1.4, driftSpeed: 0.55, duration: 12 },
+    hard:   { driftStrength: 2.0, driftSpeed: 0.80, duration: 15 },
+  },
+};
+
+/* ============================================================================
+   INPUT MODULE  —  device tilt abstraction.
+   Exposes: Input.start(), Input.getTilt() -> gamma degrees (or null),
+            Input.hasData. Swap this whole module for Unity's gyro later.
+   ============================================================================ */
+const Input = (() => {
+  let rawGamma = 0;      // latest smoothed gamma in degrees
+  let hasData = false;   // have we ever received a sensor event?
+  let lastEventTime = 0;
+
+  function onOrientation(e) {
+    // gamma = left/right roll in degrees. We deliberately ignore beta (front/back).
+    if (e.gamma === null || e.gamma === undefined) return;
+    // Light smoothing to kill sensor jitter.
+    rawGamma += (e.gamma - rawGamma) * CONFIG.tiltSmoothing;
+    hasData = true;
+    lastEventTime = performance.now();
+  }
+
+  async function start() {
+    // iOS 13+ requires an explicit permission request from a user gesture.
+    if (typeof DeviceOrientationEvent !== 'undefined' &&
+        typeof DeviceOrientationEvent.requestPermission === 'function') {
+      try {
+        const res = await DeviceOrientationEvent.requestPermission();
+        if (res !== 'granted') return { ok: false, reason: 'Permission denied for motion sensors.' };
+      } catch (err) {
+        return { ok: false, reason: 'Motion permission request failed: ' + err.message };
+      }
+    }
+    // Android / others: no permission prompt, just subscribe.
+    window.addEventListener('deviceorientation', onOrientation, true);
+    return { ok: true };
+  }
+
+  return {
+    start,
+    getTilt: () => rawGamma,
+    get hasData() { return hasData; },
+    // true if we haven't seen an event in a while (sensor died / not supported)
+    isStale: () => performance.now() - lastEventTime > 1000,
+  };
+})();
+
+/* ============================================================================
+   HAPTICS MODULE  —  the ONLY feedback channel. Must carry everything.
+   Web vibrate() is on/off, so we schedule our own pulse loop and fake intensity
+   with pulse length + cycle gap, and side with a pattern difference.
+   Isolated so a Unity variable-intensity script can replace it wholesale.
+   ============================================================================ */
+const Haptics = (() => {
+  const canVibrate = 'vibrate' in navigator;
+  let nextPulseAt = 0;   // timestamp when the next balance-pulse may fire
+
+  function raw(pattern) {
+    if (canVibrate) navigator.vibrate(pattern);
+  }
+
+  // Continuous balance feedback. Call every frame with:
+  //   danger: 0 (centred) .. 1 (at fall threshold)
+  //   side:  -1 left, +1 right
+  function balancePulse(danger, side, now) {
+    if (now < nextPulseAt) return;                 // still in the gap
+    const h = CONFIG.haptics;
+
+    // Interpolate intensity params from calm -> urgent by danger.
+    const d = Math.min(1, Math.max(0, danger));
+    const pulseMs = lerp(h.pulseMsCalm, h.pulseMsUrgent, d);
+    const gapMs   = lerp(h.gapMsCalm,   h.gapMsUrgent,   d);
+
+    // In the calm zone: barely-there gentle heartbeat, no side cue.
+    if (d < h.calmZone) {
+      raw(h.pulseMsCalm);
+      nextPulseAt = now + h.gapMsCalm;
+      return;
+    }
+
+    // Past the side-cue threshold: use directional pattern so player feels WHICH
+    // way they're tipping. Pattern arrays are relative and scaled by pulseMs.
+    if (d >= h.sideCueThreshold) {
+      const rel = side < 0 ? h.leftPattern : h.rightPattern;
+      const pattern = rel.map(x => Math.max(1, Math.round(x * pulseMs)));
+      raw(pattern);
+      // Cycle gap accounts for the pattern's own length so cadence stays steady.
+      const patLen = pattern.reduce((a, b) => a + b, 0);
+      nextPulseAt = now + patLen + gapMs;
+      return;
+    }
+
+    // Between calm zone and side-cue threshold: single non-directional pulse
+    // that just conveys "getting off centre".
+    raw(Math.round(pulseMs));
+    nextPulseAt = now + gapMs;
+  }
+
+  return {
+    canVibrate,
+    balancePulse,
+    fall: () => raw(CONFIG.fallPattern),
+    win:  () => raw(CONFIG.winPattern),
+    stop: () => { nextPulseAt = 0; raw(0); },
+    resetCadence: () => { nextPulseAt = 0; },
+  };
+})();
+
+function lerp(a, b, t) { return a + (b - a) * t; }
+
+/* ============================================================================
+   GAME LOGIC MODULE  —  the balance model. Pure-ish; drives Haptics + debug UI.
+   ============================================================================ */
+const Game = (() => {
+  let running = false;
+  let lean = 0;            // -1..+1 current off-centre position
+  let leanVel = 0;         // lean velocity (for weighty feel)
+  let driftTarget = 0;     // where drift currently wants to pull you
+  let driftPhase = 0;      // internal wander phase
+  let overThresholdFor = 0;// seconds spent past the fall threshold
+  let timeLeft = 0;
+  let cfg = null;          // merged CONFIG + difficulty preset
+  let lastT = 0;
+  let onEnd = null;        // callback(result)
+
+  function start(diff, endCb) {
+    // Merge the chosen difficulty preset over the base config.
+    const preset = CONFIG.difficulties[diff] || CONFIG.difficulties.medium;
+    cfg = Object.assign({}, CONFIG, preset);
+    lean = 0; leanVel = 0; driftTarget = 0; driftPhase = Math.random() * 1000;
+    overThresholdFor = 0; timeLeft = cfg.duration;
+    onEnd = endCb; running = true; lastT = performance.now();
+    Haptics.resetCadence();
+    requestAnimationFrame(loop);
+  }
+
+  function stop() { running = false; Haptics.stop(); }
+
+  function loop(now) {
+    if (!running) return;
+    let dt = (now - lastT) / 1000;
+    lastT = now;
+    if (dt > 0.1) dt = 0.1;   // clamp big frame gaps (tab switch etc.)
+
+    step(dt, now);
+    requestAnimationFrame(loop);
+  }
+
+  function step(dt, now) {
+    // --- DRIFT: smoothly wandering target that pulls lean off-centre. -------
+    // Use two out-of-phase sines as cheap smooth noise; scale to driftMax.
+    driftPhase += dt * cfg.driftSpeed;
+    driftTarget = (Math.sin(driftPhase) * 0.6 + Math.sin(driftPhase * 2.3 + 1.7) * 0.4);
+    driftTarget = Math.max(-CONFIG.driftMax, Math.min(CONFIG.driftMax, driftTarget));
+
+    // Drift accelerates lean toward its target.
+    const driftForce = (driftTarget - lean) * cfg.driftStrength;
+
+    // --- PLAYER CORRECTION: tilt pushes lean toward centre. -----------------
+    // Normalised tilt: +1 = full right tilt, -1 = full left tilt.
+    const tiltNorm = Math.max(-1.5, Math.min(1.5, Input.getTilt() / CONFIG.tiltFullDeg));
+    // Tilting right should push lean right and vice-versa: this is the counter
+    // balance. (If it feels inverted on your device, flip the sign here.)
+    const correctForce = tiltNorm * CONFIG.correctStrength;
+
+    // --- INTEGRATE ----------------------------------------------------------
+    leanVel += (driftForce + correctForce) * dt;
+    leanVel -= leanVel * CONFIG.leanDamping * dt;      // damping
+    lean += leanVel * dt;
+
+    // --- FALL CHECK (with grace period) ------------------------------------
+    if (Math.abs(lean) >= CONFIG.fallThreshold) {
+      overThresholdFor += dt;
+      if (overThresholdFor >= CONFIG.fallGrace) { end('fell'); return; }
+    } else {
+      overThresholdFor = 0;
+    }
+
+    // --- HAPTICS ------------------------------------------------------------
+    const danger = Math.min(1, Math.abs(lean) / CONFIG.fallThreshold);
+    const side = lean < 0 ? -1 : 1;
+    Haptics.balancePulse(danger, side, now);
+
+    // --- TIMER / WIN --------------------------------------------------------
+    timeLeft -= dt;
+    if (timeLeft <= 0) { end('win'); return; }
+
+    // --- DEBUG UI -----------------------------------------------------------
+    UI.render({ lean, drift: driftTarget, danger, side, timeLeft, duration: cfg.duration,
+                tilt: Input.getTilt() });
+  }
+
+  function end(result) {
+    running = false;
+    if (result === 'fell') Haptics.fall();
+    if (result === 'win')  Haptics.win();
+    if (onEnd) onEnd(result);
+  }
+
+  return { start, stop, get running() { return running; } };
+})();
+
+/* ============================================================================
+   UI MODULE  —  DEBUG visuals only. Nothing here is needed to play.
+   ============================================================================ */
+const UI = (() => {
+  const el = id => document.getElementById(id);
+  const barWrap = el('barWrap');
+
+  // Position the fall-threshold markers on the debug bar.
+  function placeThresholds() {
+    // lean -1..+1 maps to 0..100% of the bar width.
+    const w = barWrap.clientWidth;
+    const toPct = lean => (lean * 0.5 + 0.5) * 100;
+    el('thL').style.left = toPct(-CONFIG.fallThreshold) + '%';
+    el('thR').style.left = toPct(CONFIG.fallThreshold) + '%';
+  }
+
+  function render({ lean, drift, danger, side, timeLeft, duration, tilt }) {
+    const toPct = l => (Math.max(-1.1, Math.min(1.1, l)) * 0.5 + 0.5) * 100;
+    const dot = el('leanDot');
+    dot.style.left = toPct(lean) + '%';
+    dot.className = danger > 0.75 ? 'danger' : danger > 0.45 ? 'warn' : '';
+
+    el('rawTilt').textContent = tilt.toFixed(1);
+    el('leanVal').textContent = lean.toFixed(2);
+    el('driftVal').textContent = drift.toFixed(2);
+    el('timeVal').textContent = Math.max(0, timeLeft).toFixed(1);
+    el('timeFill').style.width = (100 * (1 - timeLeft / duration)) + '%';
+
+    // State line: balanced / tipping left / tipping right.
+    const s = el('state');
+    if (danger < CONFIG.haptics.sideCueThreshold) {
+      s.textContent = 'balanced'; s.className = 'balanced';
+    } else if (side < 0) {
+      s.textContent = 'tipping left!'; s.className = 'tip';
+    } else {
+      s.textContent = 'tipping right!'; s.className = 'tip';
+    }
+  }
+
+  function setEnd(result) {
+    const s = el('state');
+    if (result === 'fell') { s.textContent = 'FELL'; s.className = 'fell'; }
+    if (result === 'win')  { s.textContent = 'you made it!'; s.className = 'win'; }
+  }
+
+  function setSensorWarn(msg) { el('sensorWarn').textContent = msg || ''; }
+
+  return { placeThresholds, render, setEnd, setSensorWarn };
+})();
+
+/* ============================================================================
+   BOOTSTRAP / GLUE  —  wires buttons, difficulty, and the sensor-health check.
+   ============================================================================ */
+(() => {
+  let difficulty = 'medium';
+  let sensorCheck = null;
+
+  const startBtn = document.getElementById('startBtn');
+  const againBtn = document.getElementById('againBtn');
+
+  UI.placeThresholds();
+  window.addEventListener('resize', UI.placeThresholds);
+
+  // Difficulty chips
+  document.getElementById('difficultyRow').addEventListener('click', e => {
+    const chip = e.target.closest('.chip'); if (!chip) return;
+    difficulty = chip.dataset.diff;
+    document.querySelectorAll('.chip').forEach(c => c.classList.toggle('active', c === chip));
+  });
+
+  if (!Haptics.canVibrate) {
+    UI.setSensorWarn('⚠ navigator.vibrate not supported on this browser — no haptics.');
+  }
+
+  async function begin() {
+    const res = await Input.start();
+    if (!res.ok) { UI.setSensorWarn('⚠ ' + res.reason); return; }
+
+    // Sensor-health watchdog: warn if no orientation data is arriving.
+    UI.setSensorWarn('waiting for tilt data…');
+    clearInterval(sensorCheck);
+    sensorCheck = setInterval(() => {
+      if (!Input.hasData) UI.setSensorWarn('⚠ No tilt data yet. Are you on HTTPS on a real phone?');
+      else if (Input.isStale()) UI.setSensorWarn('⚠ Tilt sensor went quiet (stale data).');
+      else UI.setSensorWarn('✓ tilt sensor live');
+    }, 500);
+
+    startBtn.style.display = 'none';
+    againBtn.style.display = 'none';
+    Game.start(difficulty, onEnd);
+  }
+
+  function onEnd(result) {
+    UI.setEnd(result);
+    againBtn.style.display = '';
+    startBtn.style.display = 'none';
+  }
+
+  startBtn.addEventListener('click', begin);
+  againBtn.addEventListener('click', () => {
+    againBtn.style.display = 'none';
+    Game.start(difficulty, onEnd);   // sensor already enabled; just restart logic
+  });
+})();
+</script>
+</body>
+</html>
