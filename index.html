@@ -63,12 +63,16 @@
 <body>
 <div id="app">
   <h1>BLIND MAGE · BALANCE</h1>
-  <p class="muted">Tilt the phone left/right to counter-balance on the log. Feel the vibration — eyes closed. Visuals are debug only.</p>
+  <p class="muted">Tilt the phone to counter-balance on the log. A voice tells you which way to tilt, and the vibration backs it up — playable eyes closed. Visuals are debug only.</p>
 
   <div class="row" id="difficultyRow">
     <div class="chip" data-diff="easy">Easy</div>
     <div class="chip active" data-diff="medium">Medium</div>
     <div class="chip" data-diff="hard">Hard</div>
+  </div>
+
+  <div class="row">
+    <div class="chip active" id="voiceChip">Voice: on</div>
   </div>
 
   <div class="row">
@@ -163,35 +167,62 @@ const CONFIG = {
   // Web vibration is on/off only, so "intensity" is faked with pulse length and
   // how often pulses fire. We interpolate between CALM (near centre) and URGENT
   // (near falling) using |lean| normalised to the fall threshold.
+  // NOTE: values are deliberately STRONG/obvious — this is an accessibility game
+  // for blind players, so err toward buzzes you can't miss.
   haptics: {
     // Pulse ON duration (ms) — grows with danger (longer = feels stronger).
-    pulseMsCalm:   15,
-    pulseMsUrgent: 70,
+    pulseMsCalm:   35,   // even the calm heartbeat is a clear, felt tap
+    pulseMsUrgent: 130,  // near-falling: long, insistent buzz
     // Gap between pulse *cycles* (ms) — shrinks with danger (faster = urgent).
-    gapMsCalm:   850,   // calm heartbeat: infrequent (~1.2 Hz)
-    gapMsUrgent:  90,   // urgent: rapid-fire buzz
-    // Below this |lean| (normalised 0..1) we're "centred": barely buzz at all.
-    calmZone: 0.20,
+    gapMsCalm:   700,   // calm heartbeat: steady, unmistakable
+    gapMsUrgent:  70,   // urgent: near-continuous rapid buzz
+    // Below this |lean| (normalised 0..1) we're "centred": gentle heartbeat only.
+    calmZone: 0.14,     // feedback kicks in sooner so you're never guessing
 
-    // ---- SIDE CUE: which way am I tipping? -------------------------------
-    // Vibration has no direction, so LEFT vs RIGHT is conveyed by PATTERN.
-    // These are vibrate() pattern arrays [on,off,on,off,...] in ms, scaled by
-    // urgency at runtime. NEEDS REAL-DEVICE TESTING to confirm they're
-    // distinguishable by feel alone.
-    //   LEFT  = double-buzz  (buzz-buzz)   -> "two taps means lean is left"
-    //   RIGHT = single buzz  (one longer)  -> "one tap means lean is right"
-    leftPattern:  [1, 0.35, 1],   // relative: on, off, on  (doubled)
-    rightPattern: [1.6],          // relative: single, a bit longer/stronger
+    // ---- SIDE CUE: which way should I TILT to recover? ------------------
+    // Vibration has no direction, so the corrective side is conveyed by PATTERN.
+    // The cue means the ACTION to take (matches the voice), not the way you're
+    // falling. NEEDS REAL-DEVICE TESTING to confirm they're distinguishable.
+    //   "tilt LEFT"  = double-buzz  (buzz-buzz)   -> "two taps = tilt left"
+    //   "tilt RIGHT" = single long buzz          -> "one long tap = tilt right"
+    leftPattern:  [1, 0.6, 1],    // relative: on, off, on  (clear double)
+    rightPattern: [1.9],          // relative: one longer, stronger single
 
-    // Only apply a directional pattern once past this danger level; below it,
-    // both sides feel like the same gentle centred heartbeat.
-    sideCueThreshold: 0.32,
+    // Apply the directional pattern once past this danger level; below it, both
+    // sides feel like the same gentle centred heartbeat ("you're steady").
+    sideCueThreshold: 0.22,   // announce direction early
   },
 
   // Distinct FALL buzz: one sharp long buzz.
-  fallPattern: [500],
+  fallPattern: [600],
   // Celebratory SUCCESS pattern.
-  winPattern: [60, 60, 60, 60, 120, 80, 240],
+  winPattern: [80, 60, 80, 60, 140, 80, 260],
+
+  // ---- VOICE GUIDANCE (Web Speech API) ----------------------------------
+  // Spoken cues are the PRIMARY guidance for blind players; haptics back it up.
+  // Uses the phone's built-in TTS — no external files, still one HTML file.
+  // Set enabled:false to return to the original vibration-only design.
+  voice: {
+    enabled: true,
+    rate: 1.15,     // slightly fast so the cue keeps up with the action
+    pitch: 1.0,
+    volume: 1.0,
+    // Phrases tell the player the ACTION to take (the direction to tilt).
+    leftPhrase:  'tilt left',
+    rightPhrase: 'tilt right',
+    steadyPhrase: 'steady',    // spoken once when you recover to centre
+    fallPhrase:  'you fell',
+    winPhrase:   'you made it',
+    startPhrase: 'balance',    // spoken on Start to warm up the TTS engine
+    // Start speaking a direction once danger passes this (0..1).
+    cueThreshold: 0.22,
+    // Re-speak the SAME direction at most this often (ms) while still tipping.
+    repeatMs: 1300,
+    // Minimum gap between ANY two utterances (ms) — stops it stuttering.
+    minGapMs: 500,
+    // Announce "steady" when you return to the calm zone after being in danger.
+    announceSteady: true,
+  },
 
   // ---- DIFFICULTY PRESETS -----------------------------------------------
   // Each preset overrides drift strength/speed/reach and duration. Correction
@@ -326,6 +357,52 @@ const Haptics = (() => {
 function lerp(a, b, t) { return a + (b - a) * t; }
 
 /* ============================================================================
+   VOICE MODULE  —  spoken guidance for blind players (Web Speech API).
+   PRIMARY feedback channel now (haptics back it up). Announces the ACTION to
+   take ("tilt left"/"tilt right"), throttled so it doesn't stutter. Isolated so
+   Unity can swap in native TTS / pre-recorded clips later.
+   ============================================================================ */
+const Voice = (() => {
+  const synth = window.speechSynthesis;
+  const canSpeak = !!synth && typeof SpeechSynthesisUtterance !== 'undefined';
+  let lastAt = 0;         // timestamp of last utterance
+  let lastPhrase = '';    // what we last said (to rate-limit repeats)
+
+  // force=true bypasses throttling (fall/win/start); otherwise we rate-limit.
+  function say(text, force) {
+    if (!canSpeak || !CONFIG.voice.enabled) return;
+    const now = performance.now();
+    if (!force) {
+      // Don't repeat the same phrase too often, and never stutter.
+      if (text === lastPhrase && now - lastAt < CONFIG.voice.repeatMs) return;
+      if (now - lastAt < CONFIG.voice.minGapMs) return;
+    }
+    // Cancel any queued/among speech so guidance is always current, not stale.
+    try { synth.cancel(); } catch (e) {}
+    const u = new SpeechSynthesisUtterance(text);
+    u.rate = CONFIG.voice.rate;
+    u.pitch = CONFIG.voice.pitch;
+    u.volume = CONFIG.voice.volume;
+    synth.speak(u);
+    lastAt = now; lastPhrase = text;
+  }
+
+  return {
+    canSpeak,
+    say,
+    // Guidance: cueSide is the direction to TILT to recover (-1 left, +1 right).
+    guide: (cueSide) => say(cueSide < 0 ? CONFIG.voice.leftPhrase : CONFIG.voice.rightPhrase),
+    steady: () => { if (CONFIG.voice.announceSteady) say(CONFIG.voice.steadyPhrase); },
+    fall:  () => say(CONFIG.voice.fallPhrase, true),
+    win:   () => say(CONFIG.voice.winPhrase, true),
+    // Spoken from the Start gesture: warms up TTS so first in-game cue isn't laggy.
+    prime: () => say(CONFIG.voice.startPhrase, true),
+    stop:  () => { if (canSpeak) { try { synth.cancel(); } catch (e) {} } },
+    reset: () => { lastAt = 0; lastPhrase = ''; },
+  };
+})();
+
+/* ============================================================================
    GAME LOGIC MODULE  —  the balance model. Pure-ish; drives Haptics + debug UI.
    ============================================================================ */
 const Game = (() => {
@@ -338,6 +415,7 @@ const Game = (() => {
   let timeLeft = 0;
   let elapsed = 0;         // seconds since round start (for drift warm-up)
   let calibrated = false;  // have we captured neutral tilt yet this round?
+  let wasInDanger = false; // were we tipping last frame? (for "steady" cue)
   let cfg = null;          // merged CONFIG + difficulty preset
   let lastT = 0;
   let onEnd = null;        // callback(result)
@@ -348,13 +426,13 @@ const Game = (() => {
     cfg = Object.assign({}, CONFIG, preset);
     lean = 0; leanVel = 0; driftTarget = 0; driftPhase = Math.random() * 1000;
     overThresholdFor = 0; timeLeft = cfg.duration; elapsed = 0;
-    calibrated = false;
+    calibrated = false; wasInDanger = false;
     onEnd = endCb; running = true; lastT = performance.now();
-    Haptics.resetCadence();
+    Haptics.resetCadence(); Voice.reset();
     requestAnimationFrame(loop);
   }
 
-  function stop() { running = false; Haptics.stop(); }
+  function stop() { running = false; Haptics.stop(); Voice.stop(); }
 
   function loop(now) {
     if (!running) return;
@@ -410,24 +488,37 @@ const Game = (() => {
       overThresholdFor = 0;
     }
 
-    // --- HAPTICS ------------------------------------------------------------
+    // --- FEEDBACK (haptics + voice) -----------------------------------------
     const danger = Math.min(1, Math.abs(lean) / cfg.fallThreshold);
-    const side = lean < 0 ? -1 : 1;
-    Haptics.balancePulse(danger, side, now);
+    const tipSide = lean < 0 ? -1 : 1;   // which way you're FALLING
+    const cueSide = -tipSide;            // which way to TILT to recover
+
+    // Haptics pattern encodes the corrective action (matches the voice).
+    Haptics.balancePulse(danger, cueSide, now);
+
+    // Voice: once you're tipping enough, say which way to tilt. When you recover
+    // back to the calm zone after being in danger, confirm with "steady".
+    if (danger >= CONFIG.voice.cueThreshold) {
+      Voice.guide(cueSide);
+      wasInDanger = true;
+    } else if (danger < cfg.haptics.calmZone && wasInDanger) {
+      Voice.steady();
+      wasInDanger = false;
+    }
 
     // --- TIMER / WIN --------------------------------------------------------
     timeLeft -= dt;
     if (timeLeft <= 0) { end('win'); return; }
 
-    // --- DEBUG UI -----------------------------------------------------------
-    UI.render({ lean, drift: driftTarget, danger, side, timeLeft, duration: cfg.duration,
-                tilt: Input.getRawTilt() });
+    // --- DEBUG UI (state text shows the TIPPING direction) ------------------
+    UI.render({ lean, drift: driftTarget, danger, side: tipSide, timeLeft,
+                duration: cfg.duration, tilt: Input.getRawTilt() });
   }
 
   function end(result) {
     running = false;
-    if (result === 'fell') Haptics.fall();
-    if (result === 'win')  Haptics.win();
+    if (result === 'fell') { Haptics.fall(); Voice.fall(); }
+    if (result === 'win')  { Haptics.win();  Voice.win();  }
     if (onEnd) onEnd(result);
   }
 
@@ -497,18 +588,42 @@ const UI = (() => {
   UI.placeThresholds();
   window.addEventListener('resize', UI.placeThresholds);
 
-  // Difficulty chips
-  document.getElementById('difficultyRow').addEventListener('click', e => {
+  // Difficulty chips (scoped to this row so the voice chip isn't affected)
+  const difficultyRow = document.getElementById('difficultyRow');
+  difficultyRow.addEventListener('click', e => {
     const chip = e.target.closest('.chip'); if (!chip) return;
     difficulty = chip.dataset.diff;
-    document.querySelectorAll('.chip').forEach(c => c.classList.toggle('active', c === chip));
+    difficultyRow.querySelectorAll('.chip').forEach(c => c.classList.toggle('active', c === chip));
   });
+
+  // Voice toggle chip
+  const voiceChip = document.getElementById('voiceChip');
+  function refreshVoiceChip() {
+    voiceChip.classList.toggle('active', CONFIG.voice.enabled);
+    voiceChip.textContent = 'Voice: ' + (CONFIG.voice.enabled ? 'on' : 'off');
+  }
+  if (!Voice.canSpeak) {
+    CONFIG.voice.enabled = false;
+    voiceChip.textContent = 'Voice: n/a';
+    voiceChip.style.opacity = '.5';
+  } else {
+    refreshVoiceChip();
+    voiceChip.addEventListener('click', () => {
+      CONFIG.voice.enabled = !CONFIG.voice.enabled;
+      refreshVoiceChip();
+      if (CONFIG.voice.enabled) Voice.prime();   // gesture -> warm up TTS
+      else Voice.stop();
+    });
+  }
 
   if (!Haptics.canVibrate) {
     UI.setSensorWarn('⚠ navigator.vibrate not supported on this browser — no haptics.');
   }
 
   async function begin() {
+    // Prime TTS *inside* the user gesture (before any await) so the engine is
+    // unlocked and the first in-game "tilt left/right" isn't delayed.
+    Voice.prime();
     const res = await Input.start();
     if (!res.ok) { UI.setSensorWarn('⚠ ' + res.reason); return; }
 
@@ -534,6 +649,7 @@ const UI = (() => {
 
   startBtn.addEventListener('click', begin);
   againBtn.addEventListener('click', () => {
+    Voice.prime();                   // keep TTS warm within this gesture
     againBtn.style.display = 'none';
     Game.start(difficulty, onEnd);   // sensor already enabled; just restart logic
   });
